@@ -306,7 +306,11 @@
                 } catch (e) { 
                     console.error("Data loading failed", e);
                 }
-                window.addEventListener('resize', this.handleResizeThrottled, { passive: true });
+                if (this.isMobile) {
+                    window.addEventListener('orientationchange', this.handleOrientationChange, { passive: true });
+                } else {
+                    window.addEventListener('resize', this.handleResizeThrottled, { passive: true });
+                }
             },
             beforeUnmount() {
                 this.destroyCharts();
@@ -314,6 +318,7 @@
                 if (this.searchDebounceTimer) clearTimeout(this.searchDebounceTimer);
                 if (this.resizeThrottleTimer) clearTimeout(this.resizeThrottleTimer);
                 window.removeEventListener('resize', this.handleResizeThrottled);
+                window.removeEventListener('orientationchange', this.handleOrientationChange);
             },
             methods: {
                 getCooldownMs(action) {
@@ -388,6 +393,7 @@
                 },
                 handleResizeThrottled() {
                     if (!this.currentCourse) return;
+                    if (this.isMobile) return;
                     const now = Date.now();
                     const minGap = this.isMobile ? 260 : 180;
                     if (now - this.lastResizeRenderAt < minGap) {
@@ -400,6 +406,13 @@
                     }
                     this.lastResizeRenderAt = now;
                     this.queueRender('resize');
+                },
+                handleOrientationChange() {
+                    if (!this.currentCourse) return;
+                    if (this.resizeThrottleTimer) clearTimeout(this.resizeThrottleTimer);
+                    this.resizeThrottleTimer = setTimeout(() => {
+                        this.queueRender('orientation-change');
+                    }, 280);
                 },
                 safeDestroyChart(chartRefName) {
                     const chart = this[chartRefName];
