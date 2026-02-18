@@ -210,7 +210,45 @@
                     isExporting: false,
                     isClickLocked: false,
                     lastClickTime: 0,
-                    isMobile: /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
+                    isMobile: /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent),
+                    interactionTimer: null,
+                    searchDebounceTimer: null,
+                    resizeThrottleTimer: null,
+                    lastResizeRenderAt: 0,
+                    isRendering: false,
+                    isRenderQueued: false,
+                    needsRender: false,
+                    renderErrorRetryCount: 0,
+                    maxRenderErrorRetry: 1,
+                    lowPerfMode: false,
+                    renderPerfHistory: [],
+                    debugMetrics: {
+                        blockedInteractions: 0,
+                        renderCount: 0,
+                        lastRenderMs: 0
+                    },
+                    cooldownConfig: {
+                        desktop: {
+                            termToggle: 1000,
+                            metric: 900,
+                            aBand: 900,
+                            change: 1100,
+                            trend: 900,
+                            courseSelect: 1500,
+                            chartPoint: 1000,
+                            default: 1000
+                        },
+                        mobile: {
+                            termToggle: 700,
+                            metric: 620,
+                            aBand: 620,
+                            change: 1050,
+                            trend: 760,
+                            courseSelect: 1250,
+                            chartPoint: 700,
+                            default: 720
+                        }
+                    }
                 }
             },
             computed: {
@@ -254,7 +292,7 @@
             watch: {
                 anomalyEnabled() {
                     if (!this.currentCourse) return;
-                    this.renderCharts();
+                    this.queueRender('anomaly-watch');
                 }
             },
             async mounted() {
@@ -268,68 +306,138 @@
                 } catch (e) { 
                     console.error("Data loading failed", e);
                 }
+                window.addEventListener('resize', this.handleResizeThrottled, { passive: true });
             },
             beforeUnmount() {
                 this.destroyCharts();
+                if (this.interactionTimer) clearTimeout(this.interactionTimer);
+                if (this.searchDebounceTimer) clearTimeout(this.searchDebounceTimer);
+                if (this.resizeThrottleTimer) clearTimeout(this.resizeThrottleTimer);
+                window.removeEventListener('resize', this.handleResizeThrottled);
             },
             methods: {
-                destroyCharts() {
-                    try {
-                        if (this.trendChart) {
-                            this.trendChart.destroy();
-                            this.trendChart = null;
-                        }
-                        if (this.bandChart) {
-                            this.bandChart.destroy();
-                            this.bandChart = null;
-                        }
-                    } catch (e) {
-                        console.error('Error destroying charts:', e);
-                    }
+                getCooldownMs(action) {
+                    const profile = this.isMobile ? this.cooldownConfig.mobile : this.cooldownConfig.desktop;
+                    return profile[action] || profile.default;
                 },
-                toggleTerm(termValue) {
-                    // 共享锁：任何操作都会禁止所有其他操作
+                beginInteraction(action, overrideMs = null) {
                     if (this.isClickLocked) {
-                        console.log('Please wait, operation in progress...');
+                        this.debugMetrics.blockedInteractions += 1;
+                        return false;
+                    }
+                    this.isClickLocked = true;
+                    this.lastClickTime = Date.now();
+                    if (this.interactionTimer) clearTimeout(this.interactionTimer);
+                    const cooldown = overrideMs ?? this.getCooldownMs(action);
+                    this.interactionTimer = setTimeout(() => {
+                        this.isClickLocked = false;
+                    }, cooldown);
+                    return true;
+                },
+                queueRender(reason = 'unknown') {
+                    if (!this.currentCourse) return;
+                    this.needsRender = true;
+                    if (this.isRenderQueued) return;
+                    this.isRenderQueued = true;
+                    Promise.resolve().then(() => this.flushRenderQueue(reason));
+                },
+                flushRenderQueue(reason = 'unknown') {
+                    if (this.isRendering) {
+                        this.isRenderQueued = false;
                         return;
                     }
-                    
-                    this.isClickLocked = true;
-                    
+                    if (!this.needsRender) {
+                        this.isRenderQueued = false;
+                        return;
+                    }
+                    this.isRendering = true;
+                    this.isRenderQueued = false;
+                    this.needsRender = false;
+                    const renderStart = performance.now();
+                    try {
+                        this.destroyCharts();
+                        this.$nextTick(() => {
+                            try {
+                                this.initTrendChart();
+                                this.updateBandChart();
+                                this.renderErrorRetryCount = 0;
+                            } catch (err) {
+                                console.error('Chart render failed:', err);
+                                if (this.renderErrorRetryCount < this.maxRenderErrorRetry) {
+                                    this.renderErrorRetryCount += 1;
+                                    this.needsRender = true;
+                                }
+                            } finally {
+                                const renderMs = performance.now() - renderStart;
+                                this.debugMetrics.renderCount += 1;
+                                this.debugMetrics.lastRenderMs = Number(renderMs.toFixed(1));
+                                this.renderPerfHistory.push(renderMs);
+                                if (this.renderPerfHistory.length > 12) this.renderPerfHistory.shift();
+                                const avg = this.renderPerfHistory.reduce((s, v) => s + v, 0) / this.renderPerfHistory.length;
+                                this.lowPerfMode = this.isMobile && avg > 220;
+                                this.isRendering = false;
+                                if (this.needsRender) {
+                                    this.queueRender(`follow-up:${reason}`);
+                                }
+                            }
+                        });
+                    } catch (err) {
+                        console.error('Render pipeline failure:', err);
+                        this.isRendering = false;
+                    }
+                },
+                handleResizeThrottled() {
+                    if (!this.currentCourse) return;
+                    const now = Date.now();
+                    const minGap = this.isMobile ? 260 : 180;
+                    if (now - this.lastResizeRenderAt < minGap) {
+                        if (this.resizeThrottleTimer) clearTimeout(this.resizeThrottleTimer);
+                        this.resizeThrottleTimer = setTimeout(() => {
+                            this.lastResizeRenderAt = Date.now();
+                            this.queueRender('resize');
+                        }, minGap);
+                        return;
+                    }
+                    this.lastResizeRenderAt = now;
+                    this.queueRender('resize');
+                },
+                safeDestroyChart(chartRefName) {
+                    const chart = this[chartRefName];
+                    if (!chart) return;
+                    try {
+                        chart.destroy();
+                    } catch (e) {
+                        console.error(`Error destroying ${chartRefName}:`, e);
+                    } finally {
+                        this[chartRefName] = null;
+                    }
+                },
+                destroyCharts() {
+                    this.safeDestroyChart('trendChart');
+                    this.safeDestroyChart('bandChart');
+                },
+                toggleTerm(termValue) {
+                    if (!this.beginInteraction('termToggle')) return;
                     const index = this.selectedTerms.indexOf(termValue);
                     if (index > -1) {
-                        // 如果已选中，则取消选择
                         this.selectedTerms.splice(index, 1);
                     } else {
-                        // 如果未选中，则添加
                         this.selectedTerms.push(termValue);
                     }
-                    
-                    // 重置选中的记录索引为最新的一条
                     this.selectedRecordIndex = Math.max(0, this.filteredRecords.length - 1);
-                    this.renderCharts();
-                    
-                    setTimeout(() => {
-                        this.isClickLocked = false;
-                    }, this.isMobile ? 1200 : 1000);
+                    this.queueRender('term-toggle');
                 },
                 selectMetric(metric) {
-                    if (this.isClickLocked) return;
-                    this.isClickLocked = true;
+                    if (this.selectedMetric === metric) return;
+                    if (!this.beginInteraction('metric')) return;
                     this.selectedMetric = metric;
-                    this.renderCharts();
-                    setTimeout(() => {
-                        this.isClickLocked = false;
-                    }, this.isMobile ? 1200 : 900);
+                    this.queueRender('metric');
                 },
                 selectABand(band) {
-                    if (this.isClickLocked || this.selectedABand === band) return;
-                    this.isClickLocked = true;
+                    if (this.selectedABand === band) return;
+                    if (!this.beginInteraction('aBand')) return;
                     this.selectedABand = band;
-                    this.renderCharts();
-                    setTimeout(() => {
-                        this.isClickLocked = false;
-                    }, this.isMobile ? 1200 : 900);
+                    this.queueRender('a-band');
                 },
                 getRangeOptionClass(band) {
                     const activeStyles = {
@@ -428,26 +536,23 @@
                     return glow[metric] || {};
                 },
                 toggleAnomaly() {
-                    if (this.isAnomalyLocked || this.isClickLocked) return;
+                    if (this.isAnomalyLocked) return;
+                    if (!this.beginInteraction('change')) return;
                     this.isAnomalyLocked = true;
-                    this.isClickLocked = true;
                     this.anomalyEnabled = !this.anomalyEnabled;
                     if (!this.anomalyEnabled) {
                         this.trendEnabled = false;
                     }
+                    this.queueRender('change');
                     setTimeout(() => {
                         this.isAnomalyLocked = false;
-                        this.isClickLocked = false;
-                    }, this.isMobile ? 1400 : 1100);
+                    }, this.getCooldownMs('change'));
                 },
                 toggleTrend() {
-                    if (this.isClickLocked || !this.anomalyEnabled) return;
-                    this.isClickLocked = true;
+                    if (!this.anomalyEnabled) return;
+                    if (!this.beginInteraction('trend')) return;
                     this.trendEnabled = !this.trendEnabled;
-                    this.renderCharts();
-                    setTimeout(() => {
-                        this.isClickLocked = false;
-                    }, this.isMobile ? 1200 : 900);
+                    this.queueRender('trend');
                 },
                 normalizeCourseText(value) {
                     return String(value || '')
@@ -468,6 +573,10 @@
                     return normalizedQuery;
                 },
                 handleSearch() {
+                    if (this.searchDebounceTimer) clearTimeout(this.searchDebounceTimer);
+                    this.searchDebounceTimer = setTimeout(() => this.runSearch(), this.isMobile ? 180 : 120);
+                },
+                runSearch() {
                     const rawQuery = this.searchQuery.trim();
                     if (!rawQuery) return this.searchResults = [];
 
@@ -498,13 +607,7 @@
                         .map((entry) => entry.item);
                 },
                 selectCourse(id) {
-                    // 共享锁：任何操作都会禁止所有其他操作
-                    if (this.isClickLocked) {
-                        console.log('Please wait, operation in progress...');
-                        return;
-                    }
-                    
-                    this.isClickLocked = true;
+                    if (!this.beginInteraction('courseSelect')) return;
                     this.currentCourse = id;
                     this.searchResults = [];
                     this.searchQuery = '';
@@ -517,28 +620,14 @@
                     });
 
                     this.selectedRecordIndex = this.allData[id].length - 1;
-                    
-                    this.$nextTick(() => {
-                        this.renderCharts();
-                        // 搜索后渲染两个图表：移动端4秒，桌面端1.5秒
-                        setTimeout(() => {
-                            this.isClickLocked = false;
-                        }, this.isMobile ? 1800 : 1500);
-                    });
+                    this.queueRender('course-select');
                 },
                 getTermColor(term) {
                     const colors = { 'Summer': '#F59E0B', 'Semester 1': '#3B82F6', 'Semester 2': '#8B5CF6' };
                     return colors[term] || '#888';
                 },
                 renderCharts() {
-                    // 销毁旧图表
-                    this.destroyCharts();
-                    
-                    // 等待DOM更新后创建新图表
-                    this.$nextTick(() => {
-                        this.initTrendChart();
-                        this.updateBandChart();
-                    });
+                    this.queueRender('legacy-call');
                 },
                 exportReportImage() {
                     if (!this.currentCourse || !this.selectedRecord) return;
@@ -712,6 +801,7 @@
 
                     const ctx = canvas.getContext('2d');
                     const self = this;
+                    this.safeDestroyChart('trendChart');
                     const metricValues = records.map((record) => {
                         if (this.selectedMetric === 'headcount') return Number(record.headcount || 0);
                         if (this.selectedMetric === 'risk_rate') return Number(record.risk_rate || 0);
@@ -826,22 +916,15 @@
                         options: {
                             responsive: true,
                             maintainAspectRatio: false,
+                            animation: this.isMobile
+                                ? (this.lowPerfMode ? false : { duration: 180 })
+                                : { duration: 1000 },
                             onClick: function(e, elements) {
                                 if (elements.length > 0) {
-                                    // 共享锁：任何操作都会禁止所有其他操作
-                                    if (self.isClickLocked) {
-                                        console.log('Please wait, operation in progress...');
-                                        return;
-                                    }
-                                    
-                                    self.isClickLocked = true;
+                                    if (!self.beginInteraction('chartPoint')) return;
                                     const clickedIndex = elements[0].index;
                                     self.selectedRecordIndex = clickedIndex;
                                     self.updateBandChart();
-                                    
-                                    setTimeout(() => {
-                                        self.isClickLocked = false;
-                                    }, self.isMobile ? 1200 : 1000);
                                 }
                             },
                             scales: {
@@ -909,15 +992,7 @@
                     const canvas = document.getElementById('bandChart');
                     if (!canvas || !this.selectedRecord) return;
 
-                    // 销毁旧的band chart
-                    if (this.bandChart) {
-                        try {
-                            this.bandChart.destroy();
-                        } catch (e) {
-                            console.error('Error destroying band chart:', e);
-                        }
-                        this.bandChart = null;
-                    }
+                    this.safeDestroyChart('bandChart');
 
                     const bands = this.selectedRecord.bands;
                     const headcount = Number(this.selectedRecord.headcount || 0);
@@ -938,6 +1013,9 @@
                             indexAxis: 'y',
                             responsive: true,
                             maintainAspectRatio: false,
+                            animation: this.isMobile
+                                ? (this.lowPerfMode ? false : { duration: 160 })
+                                : { duration: 1000 },
                             plugins: {
                                 legend: { display: false },
                                 tooltip: {
